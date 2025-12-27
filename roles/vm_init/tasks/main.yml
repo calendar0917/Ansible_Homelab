@@ -1,0 +1,34 @@
+---
+# 1. 换源与更新
+- name: Update APT to USTC Mirror
+  copy:
+    dest: /etc/apt/sources.list
+    content: |
+      deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie main contrib non-free non-free-firmware
+      deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie-updates main contrib non-free non-free-firmware
+      deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie-backports main contrib non-free non-free-firmware
+
+# 只有 apt update 成功了，才能安装 curl
+- name: Update APT Cache and Install Prerequisites
+  apt:
+    update_cache: yes
+    # 如果源文件变了，强制更新缓存；或者每 33600
+    name:
+      - curl
+      - gnupg
+      - ca-certificates
+    state: present
+
+# 2. 安装 Docker Engine (使用官方脚本或镜像)
+- name: Install Docker via Aliyun Mirror
+  shell: curl -fsSL https://get.docker.com | bash -s -- --mirror Aliyun 
+  args:
+    creates: /usr/bin/docker
+
+# 3. 挂载数据盘 (假设 PVE 已通过 VirtIO 将 240G 盘挂载为 /dev/sdb)
+- name: Mount Data Disk
+  mount:
+    path: /data
+    src: UUID=7ab6ec45-77eb-41f4-a348-b9c3a72ef428
+    fstype: ext4
+    state: mounted

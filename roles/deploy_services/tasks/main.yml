@@ -1,0 +1,104 @@
+---
+# 1. 配置 Docker 镜像源
+- name: Configure Docker Registry Mirrors
+  copy:
+    dest: /etc/docker/daemon.json
+    content: |
+      {
+        "registry-mirrors": [
+          "https://docker.1panel.live",
+          "https://hub.rat.dev",
+          "https://huecker.io",
+          "https://dockerhub.timeweb.cloud",
+          "https://noohzy.com"
+        ]
+      }
+    mode: '0644'
+  register: docker_config
+
+- name: Restart Docker to Apply Mirrors
+  service:
+    name: docker
+    state: restarted
+  when: docker_config.changed
+
+# 2. 创建监控所需的目录并设置正确的权限 (关键步骤)
+- name: Create Monitoring Data Directories
+  file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner | default('root') }}"
+    group: "{{ item.group | default('root') }}"
+    mode: '0755'
+  loop:
+    - { path: '/data/compose' }
+    - { path: '/data/prometheus_config' }
+    - { path: '/data/prometheus_data', owner: '65534', group: '65534' } # Prometheus 用户 nobody
+    - { path: '/data/grafana_data', owner: '472', group: '472' }       # Grafana 用户
+
+# 3. 部署 Prometheus 配置文件 (如果不部署，Prometheus 启动后将无法采集数据)
+- name: Deploy Prometheus Configuration
+  copy:
+    dest: /data/prometheus_config/prometheus.yml
+    content: |
+      global:
+        scrape_interval: 15s
+      scrape_configs:
+        - job_name: 'node-exporter'
+          static_configs:
+            - targets: ['node-exporter:9100']
+        - job_name: 'cadvisor'
+          static_configs:
+            - targets: ['cadvisor:8080']
+    mode: '0644'
+
+# 4. 部署 Docker Compose 配置文件
+- name: Deploy Docker Compose Configuration
+  template:
+    src: docker-compose.yml.j2
+    dest: /data/compose/docker-compose.yml
+    mode: '0644'
+
+- name: Generate Universal Prometheus Discovery Config
+  copy:
+    dest: /data/prometheus_config/prometheus.yml
+    content: |
+      global:
+        scrape_interval: 15s
+
+      scrape_configs:
+        - job_name: 'pve-host'
+          static_configs:
+            - targets: ['192.168.50.1:9100']
+
+        # 1. 依然保留对宿主机 node-exporter 的监控（因为它在 host 模式，不在 docker 列表里）
+        - job_name: 'node-exporter'
+          static_configs:
+            - targets: ['host.docker.internal:9100']
+
+        # 2. 自动发现所有带标签的 Docker 容器
+        - job_name: 'docker-containers'
+          docker_sd_configs:
+            - host: unix:///var/run/docker.sock # 访问挂载进来的 socket
+          relabel_configs:
+            # 只有带 monitor=true 标签的容器才会被抓取
+            - source_labels: [__meta_docker_container_label_monitor]
+              regex: true
+              action: keep
+            # 动态读取 monitor_port 标签作为抓取端口
+            - source_labels: [__address__, __meta_docker_container_label_monitor_port]
+              regex: ([^:]+)(?::\d+)?;(\d+)
+              replacement: $1:$2
+              target_label: __address__
+            # 把容器名提取出来作为最终的实例名字
+            - source_labels: [__meta_docker_container_name]
+              target_label: instance
+
+# 5. 启动服务
+- name: Start Docker Services
+  community.docker.docker_compose_v2:
+    project_src: /data/compose
+    files:
+      - docker-compose.yml
+    state: present
+    pull: missing

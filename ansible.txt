@@ -1,0 +1,566 @@
+Project Path: homelab-ansible
+
+Source Tree:
+
+```txt
+homelab-ansible
+├── ansible.cfg
+├── ansible.txt
+├── files
+│   ├── homepage_config
+│   │   └── settings.yaml
+│   └── keep_alive.py
+├── group_vars
+│   ├── all.yml
+│   ├── docker_vm.yml
+│   └── pve.yml
+├── inventory.ini
+├── roles
+│   ├── deploy_services
+│   │   ├── tasks
+│   │   │   └── main.yml
+│   │   └── templates
+│   │       └── docker-compose.yml.j2
+│   ├── pve_host
+│   │   ├── tasks
+│   │   │   └── main.yml
+│   │   └── templates
+│   │       └── keep_alive.py.j2
+│   └── vm_init
+│       └── tasks
+│           └── main.yml
+└── site.yml
+
+```
+
+`ansible.cfg`:
+
+```cfg
+[defaults]
+# 指向刚才创建的密码文件
+vault_password_file = ~/.ansible_vault_pass
+# 顺便关闭 Host Key 检查，方便你反复重装容器
+host_key_checking = False
+
+```
+
+`files/homepage_config/settings.yaml`:
+
+```yaml
+title: My Personal Lab
+
+```
+
+`files/keep_alive.py`:
+
+```py
+import requests
+import time
+import urllib.parse
+import sys
+import subprocess
+
+# ================= 配置区 =================
+USER = os.getenv('RUIJIE_USER')
+# 填入你那个超长的加密字符串
+ENCRYPTED_PASS = os.getenv('RUIJIE_PASS')
+# =========================================
+
+def check_internet():
+    """check the internet"""
+    try:
+        # ping baidu or 1.1.1.1，timeout 2 second
+        subprocess.check_call(["ping", "-c", "1", "-W", "2", "223.5.5.5"], 
+                            stdout=subprocess.DEVNULL, 
+                            stderr=subprocess.DEVNULL)
+        return True
+    except:
+        return False
+
+def get_current_qs():
+    try:
+        r = requests.get("http://1.1.1.1", allow_redirects=False, timeout=3)
+        if "Location" in r.headers:
+            full = r.headers["Location"]
+            if "?" in full: return full.split("?", 1)[1]
+    except: pass
+    return ""
+
+def login():
+    qs = get_current_qs()
+    url = "http://172.25.249.64/eportal/InterFace.do?method=login"
+    payload = {
+        "userId": USER,
+        "password": ENCRYPTED_PASS,
+        "service": "",
+        "queryString": qs,
+        "passwordEncrypt": "true"
+    }
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        print(f"[{time.strftime('%T')}] Detecting offline, trying to login...")
+        requests.post(url, data=payload, headers=headers, timeout=5)
+    except Exception as e:
+        print(f"Error: {e}")
+
+if __name__ == "__main__":
+    print(">>> Watchdog started...")
+    while True:
+        if check_internet():
+            # if ok,relax 60 seconds
+            pass
+        else:
+            # if not ok,relogin
+            login()
+            # wait 5 second for internet connect
+            time.sleep(5)
+            
+            # retry, if ok,print log
+            if check_internet():
+                print(f"[{time.strftime('%T')}] Re-connected successfully!")
+        
+        # check per 60 seconds
+        time.sleep(60)
+
+```
+
+`group_vars/pve.yml`:
+
+```yml
+ruijie_user: "17711523317"
+ruijie_encrypted_pass: "2384c6e64e96c925e38b3b1cb8aa902d420fa1c1f1929bd9bea2ebd570e5ab9fce09877546b3fef50688c98235469d45a0e584713357b496a6f672aa509e07d5fa19a292f73c96573378b33c2bd75367995d4c56b106993f9386c724aed8a68d809f9a619883d07de68038a17ea2a0139dfebfe457d7d9ba94be5deacb8542be"
+
+```
+
+`inventory.ini`:
+
+```ini
+[pve]
+# 替换为你的 Tailscale IP
+pve_host ansible_host=100.104.120.97 ansible_user=root
+
+[docker_vm]
+# 虚拟机内网固定 IP
+debian_docker ansible_host=192.168.50.2 ansible_user=root
+
+[docker_vm:vars]
+# 魔法参数：通过 PVE 宿主机进行跳板连接
+ansible_ssh_common_args='-o ProxyCommand="ssh -W %h:%p -q root@100.104.120.97"'
+
+```
+
+`roles/deploy_services/tasks/main.yml`:
+
+```yml
+---
+# 1. 配置 Docker 镜像源
+- name: Configure Docker Registry Mirrors
+  copy:
+    dest: /etc/docker/daemon.json
+    content: |
+      {
+        "registry-mirrors": [
+          "https://docker.1panel.live",
+          "https://hub.rat.dev",
+          "https://huecker.io",
+          "https://dockerhub.timeweb.cloud",
+          "https://noohzy.com"
+        ]
+      }
+    mode: '0644'
+  register: docker_config
+
+- name: Restart Docker to Apply Mirrors
+  service:
+    name: docker
+    state: restarted
+  when: docker_config.changed
+
+# 2. 创建监控所需的目录并设置正确的权限 (关键步骤)
+- name: Create Monitoring Data Directories
+  file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner | default('root') }}"
+    group: "{{ item.group | default('root') }}"
+    mode: '0755'
+  loop:
+    - { path: '/data/compose' }
+    - { path: '/data/prometheus_config' }
+    - { path: '/data/prometheus_data', owner: '65534', group: '65534' } # Prometheus 用户 nobody
+    - { path: '/data/grafana_data', owner: '472', group: '472' }       # Grafana 用户
+
+# 3. 部署 Prometheus 配置文件 (如果不部署，Prometheus 启动后将无法采集数据)
+- name: Deploy Prometheus Configuration
+  copy:
+    dest: /data/prometheus_config/prometheus.yml
+    content: |
+      global:
+        scrape_interval: 15s
+      scrape_configs:
+        - job_name: 'node-exporter'
+          static_configs:
+            - targets: ['node-exporter:9100']
+        - job_name: 'cadvisor'
+          static_configs:
+            - targets: ['cadvisor:8080']
+    mode: '0644'
+
+# 4. 部署 Docker Compose 配置文件
+- name: Deploy Docker Compose Configuration
+  template:
+    src: docker-compose.yml.j2
+    dest: /data/compose/docker-compose.yml
+    mode: '0644'
+
+- name: Generate Universal Prometheus Discovery Config
+  copy:
+    dest: /data/prometheus_config/prometheus.yml
+    content: |
+      global:
+        scrape_interval: 15s
+
+      scrape_configs:
+        - job_name: 'pve-host'
+          static_configs:
+            - targets: ['192.168.50.1:9100']
+
+        # 1. 依然保留对宿主机 node-exporter 的监控（因为它在 host 模式，不在 docker 列表里）
+        - job_name: 'node-exporter'
+          static_configs:
+            - targets: ['host.docker.internal:9100']
+
+        # 2. 自动发现所有带标签的 Docker 容器
+        - job_name: 'docker-containers'
+          docker_sd_configs:
+            - host: unix:///var/run/docker.sock # 访问挂载进来的 socket
+          relabel_configs:
+            # 只有带 monitor=true 标签的容器才会被抓取
+            - source_labels: [__meta_docker_container_label_monitor]
+              regex: true
+              action: keep
+            # 动态读取 monitor_port 标签作为抓取端口
+            - source_labels: [__address__, __meta_docker_container_label_monitor_port]
+              regex: ([^:]+)(?::\d+)?;(\d+)
+              replacement: $1:$2
+              target_label: __address__
+            # 把容器名提取出来作为最终的实例名字
+            - source_labels: [__meta_docker_container_name]
+              target_label: instance
+
+# 5. 启动服务
+- name: Start Docker Services
+  community.docker.docker_compose_v2:
+    project_src: /data/compose
+    files:
+      - docker-compose.yml
+    state: present
+    pull: missing
+
+```
+
+`roles/deploy_services/templates/docker-compose.yml.j2`:
+
+```j2
+# {{ ansible_managed }}
+services:
+  # 定义一个通用的日志模板，方便下方复用
+  x-logging: &default-logging
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # 1. Portainer (容器管理)
+  portainer:
+    <<: *default-logging
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    restart: always
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /data/portainer_data:/data
+    ports:
+      - "9000:9000"
+
+  # 2. Nginx Proxy Manager (网关)
+  npm:
+    <<: *default-logging
+    image: 'jc21/nginx-proxy-manager:latest'
+    container_name: npm
+    restart: unless-stopped
+    ports:
+      - '80:80'
+      - '81:81'
+      - '443:443'
+    volumes:
+      - /data/npm_data:/data
+      - /data/npm_letsencrypt:/etc/letsencrypt
+    depends_on:
+      - npm-db
+
+  # 3. MariaDB (NPM 数据库)
+  npm-db:
+    <<: *default-logging
+    image: 'jc21/mariadb-aria:latest'
+    container_name: npm-db
+    environment:
+      MYSQL_ROOT_PASSWORD: 'npm'
+      MYSQL_DATABASE: 'npm'
+      MYSQL_USER: 'npm'
+      MYSQL_PASSWORD: 'npm'
+    volumes:
+      - /data/npm_mysql:/var/lib/mysql
+
+  # 4. Prometheus (监控数据库)
+  prometheus:
+    <<: *default-logging
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    user: root
+    ports:
+      - "9090:9090"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /data/prometheus_config/prometheus.yml:/etc/prometheus/prometheus.yml
+      - /data/prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d' # 顺便帮你增加了数据保留时间，建议30天
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # 5. Node Exporter (主机监控)
+  node-exporter:
+    <<: *default-logging
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    network_mode: host
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+  
+  # 6. Grafana (可视化面板)
+  grafana:
+    <<: *default-logging
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    user: "472"
+    ports:
+      - "3000:3000"
+    volumes:
+      - /data/grafana_data:/var/lib/grafana
+
+  # 7. cAdvisor (容器指标抓取)
+  cadvisor:
+    <<: *default-logging
+    image: gcr.m.daocloud.io/cadvisor/cadvisor:v0.49.1
+    container_name: cadvisor
+    restart: unless-stopped
+    privileged: true
+    devices:
+      - /dev/kmsg
+    labels:
+      monitor: "true"
+      monitor_port: "8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+
+```
+
+`roles/pve_host/tasks/main.yml`:
+
+```yml
+---
+# 1. 开启内网网桥 vmbr1
+- name: Configure vmbr1 interface
+  blockinfile:
+    path: /etc/network/interfaces
+    block: |
+      auto vmbr1
+      iface vmbr1 inet static
+          address 192.168.50.1/24
+          bridge-ports none
+          bridge-stp off
+          bridge-fd 0
+          # NAT 转发规则
+          post-up echo 1 > /proc/sys/net/ipv4/ip_forward
+          post-up iptables -t nat -A POSTROUTING -s '192.168.50.0/24' -o enp3s0 -j MASQUERADE
+          post-down iptables -t nat -D POSTROUTING -s '192.168.50.0/24' -o enp3s0 -j MASQUERADE
+
+          # 将访问宿主机 enp3s0 的 80/443/81 端口转发给 Debian 虚拟机 (192.168.50.2)
+          post-up iptables -t nat -A PREROUTING -p tcp --dport 80 -j DNAT --to-destination 192.168.50.2:80
+          post-up iptables -t nat -A PREROUTING -p tcp --dport 443 -j DNAT --to-destination 192.168.50.2:443
+          post-up iptables -t nat -A PREROUTING -p tcp --dport 81 -j DNAT --to-destination 192.168.50.2:81
+          
+          # 删除规则（对应 post-up）
+          post-down iptables -t nat -D PREROUTING -p tcp --dport 80 -j DNAT --to-destination 192.168.50.2:80
+          post-down iptables -t nat -D PREROUTING -p tcp --dport 443 -j DNAT --to-destination 192.168.50.2:443
+          post-down iptables -t nat -D PREROUTING -p tcp --dport 81 -j DNAT --to-destination 192.168.50.2:81
+# 2. 部署校园网认证脚本 (参考原 keep_alive 逻辑)
+- name: Deploy Ruijie Keep-alive Script
+  template:
+    src: keep_alive.py.j2
+    dest: /root/auth/keep_alive.py
+    mode: '0700'
+
+- name: Setup Keep-alive Systemd Service
+  copy:
+    dest: /etc/systemd/system/ruijie.service
+    content: |
+      [Unit]
+      Description=Ruijie Auth Watchdog
+      After=network.target
+      [Service]
+      ExecStart=/usr/bin/python3 /root/auth/keep_alive.py
+      Restart=always
+      [Install]
+      WantedBy=multi-user.target [cite: 32]
+
+- name: Start Auth Service
+  systemd:
+    name: ruijie
+    state: started
+    enabled: yes
+    daemon_reload: yes
+
+```
+
+`roles/pve_host/templates/keep_alive.py.j2`:
+
+```j2
+import requests
+import time
+import urllib.parse
+import sys
+import subprocess
+
+# ================= 配置区 =================
+USER = "{{ ruijie_user }}"
+# 填入你那个超长的加密字符串
+ENCRYPTED_PASS = "{{ ruijie_encrypted_pass }}"
+# =========================================
+
+def check_internet():
+    """check the internet"""
+    try:
+        # ping baidu or 1.1.1.1，timeout 2 second
+        subprocess.check_call(["ping", "-c", "1", "-W", "2", "223.5.5.5"], 
+                            stdout=subprocess.DEVNULL, 
+                            stderr=subprocess.DEVNULL)
+        return True
+    except:
+        return False
+
+def get_current_qs():
+    try:
+        r = requests.get("http://1.1.1.1", allow_redirects=False, timeout=3)
+        if "Location" in r.headers:
+            full = r.headers["Location"]
+            if "?" in full: return full.split("?", 1)[1]
+    except: pass
+    return ""
+
+def login():
+    qs = get_current_qs()
+    url = "http://172.25.249.64/eportal/InterFace.do?method=login"
+    payload = {
+        "userId": USER,
+        "password": ENCRYPTED_PASS,
+        "service": "",
+        "queryString": qs,
+        "passwordEncrypt": "true"
+    }
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        print(f"[{time.strftime('%T')}] Detecting offline, trying to login...")
+        requests.post(url, data=payload, headers=headers, timeout=5)
+    except Exception as e:
+        print(f"Error: {e}")
+
+if __name__ == "__main__":
+    print(">>> Watchdog started...")
+    while True:
+        if check_internet():
+            # if ok,relax 60 seconds
+            pass
+        else:
+            # if not ok,relogin
+            login()
+            # wait 5 second for internet connect
+            time.sleep(5)
+            
+            # retry, if ok,print log
+            if check_internet():
+                print(f"[{time.strftime('%T')}] Re-connected successfully!")
+        
+        # check per 60 seconds
+        time.sleep(60)
+
+```
+
+`roles/vm_init/tasks/main.yml`:
+
+```yml
+---
+# 1. 换源与更新
+- name: Update APT to USTC Mirror
+  copy:
+    dest: /etc/apt/sources.list
+    content: |
+      deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie main contrib non-free non-free-firmware
+      deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie-updates main contrib non-free non-free-firmware
+      deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie-backports main contrib non-free non-free-firmware
+
+# 只有 apt update 成功了，才能安装 curl
+- name: Update APT Cache and Install Prerequisites
+  apt:
+    update_cache: yes
+    # 如果源文件变了，强制更新缓存；或者每 33600
+    name:
+      - curl
+      - gnupg
+      - ca-certificates
+    state: present
+
+# 2. 安装 Docker Engine (使用官方脚本或镜像)
+- name: Install Docker via Aliyun Mirror
+  shell: curl -fsSL https://get.docker.com | bash -s -- --mirror Aliyun 
+  args:
+    creates: /usr/bin/docker
+
+# 3. 挂载数据盘 (假设 PVE 已通过 VirtIO 将 240G 盘挂载为 /dev/sdb)
+- name: Mount Data Disk
+  mount:
+    path: /data
+    src: UUID=7ab6ec45-77eb-41f4-a348-b9c3a72ef428
+    fstype: ext4
+    state: mounted
+
+```
+
+`site.yml`:
+
+```yml
+---
+- name: Configure PVE Host
+  hosts: pve
+  roles:
+    - pve_host
+
+- name: Initialize Docker VM
+  hosts: docker_vm
+  roles:
+    - vm_init
+    - deploy_services
+
+```

@@ -1,0 +1,11 @@
+---
+- name: Configure PVE Host
+  hosts: pve
+  roles:
+    - pve_host
+
+- name: Initialize Docker VM
+  hosts: docker_vm
+  roles:
+    - vm_init
+    - deploy_services

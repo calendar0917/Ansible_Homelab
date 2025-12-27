@@ -1,0 +1,52 @@
+---
+# 1. 开启内网网桥 vmbr1
+- name: Configure vmbr1 interface
+  blockinfile:
+    path: /etc/network/interfaces
+    block: |
+      auto vmbr1
+      iface vmbr1 inet static
+          address 192.168.50.1/24
+          bridge-ports none
+          bridge-stp off
+          bridge-fd 0
+          # NAT 转发规则
+          post-up echo 1 > /proc/sys/net/ipv4/ip_forward
+          post-up iptables -t nat -A POSTROUTING -s '192.168.50.0/24' -o enp3s0 -j MASQUERADE
+          post-down iptables -t nat -D POSTROUTING -s '192.168.50.0/24' -o enp3s0 -j MASQUERADE
+
+          # 将访问宿主机 enp3s0 的 80/443/81 端口转发给 Debian 虚拟机 (192.168.50.2)
+          post-up iptables -t nat -A PREROUTING -p tcp --dport 80 -j DNAT --to-destination 192.168.50.2:80
+          post-up iptables -t nat -A PREROUTING -p tcp --dport 443 -j DNAT --to-destination 192.168.50.2:443
+          post-up iptables -t nat -A PREROUTING -p tcp --dport 81 -j DNAT --to-destination 192.168.50.2:81
+          
+          # 删除规则（对应 post-up）
+          post-down iptables -t nat -D PREROUTING -p tcp --dport 80 -j DNAT --to-destination 192.168.50.2:80
+          post-down iptables -t nat -D PREROUTING -p tcp --dport 443 -j DNAT --to-destination 192.168.50.2:443
+          post-down iptables -t nat -D PREROUTING -p tcp --dport 81 -j DNAT --to-destination 192.168.50.2:81
+# 2. 部署校园网认证脚本 (参考原 keep_alive 逻辑)
+- name: Deploy Ruijie Keep-alive Script
+  template:
+    src: keep_alive.py.j2
+    dest: /root/auth/keep_alive.py
+    mode: '0700'
+
+- name: Setup Keep-alive Systemd Service
+  copy:
+    dest: /etc/systemd/system/ruijie.service
+    content: |
+      [Unit]
+      Description=Ruijie Auth Watchdog
+      After=network.target
+      [Service]
+      ExecStart=/usr/bin/python3 /root/auth/keep_alive.py
+      Restart=always
+      [Install]
+      WantedBy=multi-user.target [cite: 32]
+
+- name: Start Auth Service
+  systemd:
+    name: ruijie
+    state: started
+    enabled: yes
+    daemon_reload: yes
